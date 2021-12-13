@@ -22,12 +22,13 @@ from torch.autograd import Variable
 from torch.utils.data import DataLoader, TensorDataset
 from torch_geometric.nn import GNNExplainer as GNNE
 from torch_geometric.nn import MessagePassing
+# GRAPH_SVX_SRC=os.path.abspath(os.path.join(os.path.dirname(__file__),'..'))
+# sys.path.append(GRAPH_SVX_SRC)
+# from models import LinearRegressionModel
+# from plots import (denoise_graph, k_hop_subgraph, log_graph,
+                       # visualize_subgraph, custom_to_networkx)
 
-from src.models import LinearRegressionModel
-from src.plots import (denoise_graph, k_hop_subgraph, log_graph,
-                       visualize_subgraph, custom_to_networkx)
-
-
+from torch_geometric.utils import to_dense_adj,dense_to_sparse, from_scipy_sparse_matrix
 
 class GraphSVX():
 
@@ -150,6 +151,7 @@ class GraphSVX():
 
             # --- MASK GENERATOR --- 
             # Generate binary samples z' representing coalitions of nodes and features
+       
             z_, weights = self.mask_generation(num_samples, args_coal, args_K, D, info, regu)
 
             # Discard full and empty coalition if specified
@@ -200,7 +202,7 @@ class GraphSVX():
                        graph_indices=[0],
                        hops=2,
                        num_samples=10,
-                       info=True,
+                       info=False,
                        multiclass=False,
                        fullempty=None,
                        S=3,
@@ -258,9 +260,12 @@ class GraphSVX():
                         self.data.edge_index).exp()[graph_index,:].max(dim=0)
 
             # Remove node v index from neighbours and store their number in D
+            self.data.edge_index = to_dense_adj(self.data.edge_index)
             self.neighbours = list(
                 range(int(self.data.edge_index.shape[1] - np.sum(np.diag(self.data.edge_index[graph_index])))))
+
             D = len(self.neighbours)
+            self.data.edge_index = dense_to_sparse(self.data.edge_index)[0]
 
             # Total number of features + neighbours considered for node v
             self.F = 0
@@ -296,6 +301,47 @@ class GraphSVX():
     ################################
     # Feature selector
     ################################
+
+    def explained_graph(self):
+        graph = deepcopy(self.data)
+        x=torch.FloatTensor(self.explain_graphs()[0])
+        graph.x = (x-x.min()).div(x.max()-x.min()) 
+        return graph
+    
+    def local_infidelity(self, per_m="gaussian"):
+       graph = self.data 
+       graph.edge_index=dense_to_sparse(graph.edge_index)[0]
+       if per_m == "gaussian":
+
+           N = 100
+           vals_dp = torch.zeros(N)
+           vals_f_ga = torch.zeros(N)
+           graph_c = deepcopy(graph)
+           f_in = self.model(graph.x, graph.edge_index)
+           f_in = (f_in[0]).exp().max()
+           graph_ex = self.explained_graph()
+           N_f = np.prod(graph_ex.x.shape)
+           dim_in = graph_c.x.shape
+           for i in range(N):
+               I = torch.normal(torch.zeros(N_f), torch.ones(N_f))
+               masked_fm = torch.dot(I, graph_ex.x.flatten())
+               graph_c.x = torch.cat(
+                   (I.view(-1, 1), torch.zeros((dim_in[0], dim_in[1] - 1))), 1
+               )
+
+               f_ga = self.model(graph_c.x, graph_c.edge_index)
+               f_ga = f_ga[0].exp().max()
+               vals_f_ga[i] = f_ga
+               vals_dp[i] = masked_fm
+           return torch.mean((vals_dp - (f_in - vals_f_ga)) ** 2, 0)
+
+    def local_sparsity(self, threshold=0.01):
+        mapping = self.explained_graph().x
+        mapping = mapping >= threshold
+        return torch.sum(mapping).item() / np.prod(mapping.shape)
+
+
+
 
     def feature_selection(self, node_index, args_feat):
         """ Select features who truly impact prediction
@@ -425,7 +471,6 @@ class GraphSVX():
 
                 # Coalitions: sample num_samples binary vectors of dimension M
                 z_ = eval('self.' + args_coal)(num_samples, args_K, regu)
-
                 # Shuffle them 
                 z_ = z_[torch.randperm(z_.size()[0])]
 
@@ -681,7 +726,6 @@ class GraphSVX():
                 z_[i+self.M:i+2*self.M, :].fill_diagonal_(1)
                 i += 2 * self.M
                 k += 1
-
             else:
                 # Split in two number of remaining samples
                 # Half for specific coalitions with low k and rest random samples
@@ -706,6 +750,7 @@ class GraphSVX():
                         z_[i, L[j]] = torch.ones(k)
                         i += 1
                         # If limit reached, sample random coalitions
+
                         if i == samp:
                             z_[i:, :] = torch.empty(
                                 num_samples-i, self.M).random_(2)
@@ -1108,9 +1153,10 @@ class GraphSVX():
 
         # Init 
         fz = torch.zeros(num_samples)
-        adj = deepcopy(self.data.edge_index[graph_index])
+        self.data.edge_index = to_dense_adj(self.data.edge_index)[0]
+        adj = deepcopy(self.data.edge_index)
         if args_feat == 'Null':
-            av_feat_values = torch.zeros(self.data.x[graph_index].shape[1])
+            av_feat_values = torch.zeros(self.data.x.shape[1])
         else: 
             av_feat_values = self.data.x.mean(dim=0).mean(dim=0)
             #av_feat_values = np.mean(self.data.x[graph_index],axis=0)
@@ -1124,17 +1170,19 @@ class GraphSVX():
             A[:, ex_nei] = 0
 
             # Also change features of excluded nodes (optional)
-            X = deepcopy(self.data.x[graph_index])
+            X = deepcopy(self.data.x)
             for nei in ex_nei:
                 X[nei] = av_feat_values
 
             # Apply model on (X,A) as input.
             if self.gpu:
                 with torch.no_grad():
-                    proba = self.model(X.unsqueeze(0).cuda(), A.unsqueeze(0).cuda()).exp()
+                    A,_ = dense_to_sparse(A)
+                    proba = self.model(X.cuda(), A.cuda()).exp()
             else:
                 with torch.no_grad():
-                    proba = self.model(X.unsqueeze(0), A.unsqueeze(0)).exp()
+                    A,_ = dense_to_sparse(A)
+                    proba = self.model(X, A).exp()
 
             # Compute prediction
             fz[key] = proba[0][true_pred.item()]
@@ -1350,7 +1398,7 @@ class GraphSVX():
         y_pred = z_.detach().numpy() @ phi
         if info:
             print('r2: ', r2_score(fz, y_pred))
-            print('weighted r2: ', r2_score(fz, y_pred, weights))
+            print('weighted r2: ', r2_score(fz, y_pred, sample_weight=weights))
 
         return phi[:-1], phi[-1]
 
